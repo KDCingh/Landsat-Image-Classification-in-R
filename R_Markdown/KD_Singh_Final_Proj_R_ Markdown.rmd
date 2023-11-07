@@ -1,0 +1,554 @@
+---
+title: "Assignment Report on LULC Mapping using Available Satellite
+  RS Data and VGI In-situ Data in R"
+author: "Krishna Dev Singh"
+date: "2023-11-05"
+output:
+  html_document: default
+  editor_options: null
+  markdown:
+    wrap: 77
+  pdf_document: default
+  word_document: default
+---
+```{r include=FALSE}
+library(raster)
+library(tidyverse)
+library(sf)
+library(rpart)
+library(rpart.plot)
+library(rasterVis)
+library(mapedit)
+library(mapview)
+library(caret)
+library(e1071)
+
+setwd("D:/R_Project")
+# Load the Landsat image and the training data
+band1 <- raster("Satellite_Image/LC08_L2SP_141041_20211226_20211230_02_T1_SR_B1.TIF")
+band2 <- raster("Satellite_Image/LC08_L2SP_141041_20211226_20211230_02_T1_SR_B2.TIF")
+band3 <- raster("Satellite_Image/LC08_L2SP_141041_20211226_20211230_02_T1_SR_B3.TIF")
+band4 <- raster("Satellite_Image/LC08_L2SP_141041_20211226_20211230_02_T1_SR_B4.TIF")
+band5 <- raster("Satellite_Image/LC08_L2SP_141041_20211226_20211230_02_T1_SR_B5.TIF")
+band6 <- raster("Satellite_Image/LC08_L2SP_141041_20211226_20211230_02_T1_SR_B6.TIF")
+band7 <- raster("Satellite_Image/LC08_L2SP_141041_20211226_20211230_02_T1_SR_B7.TIF")
+# Read the individual bands and stack them
+img <- stack(band1, band2, band3, band4, band5, band6, band7)
+names(img) <- c(paste0("B", 1:7, coll = ""))
+# Define the extent
+aoi <- st_read("shp_files/Sarlahi.shp")
+aoi <-st_transform(aoi, crs(img))
+# Clip the stacked raster to the custom extent
+image <- crop(img, aoi)
+
+# plot the clipped raster True Color Composite
+par(col.axis="white",col.lab="white",tck=0)
+plotRGB(image, r = 4, g = 3, b = 2, axes = TRUE, 
+        stretch = "lin", main = "True Color Composite")
+box(col="white")
+
+# plot the clipped raster False Color Composite
+par(col.axis="white",col.lab="white",tck=0)
+plotRGB(image, r = 5, g = 4, b = 3, axes = TRUE, stretch = "lin", main = "False Color Composite")
+box(col="white")
+
+#We calculate NDVI using the following equation (NIR - Red)/(NIR + Red). The [[ ]] notation specifies the bands, in this case band 5 for NIR and band 4 for Red, within the multi-band raster.
+ndvi <- (image[[5]] - image[[4]])/(image[[5]] + image[[4]])
+
+as(ndvi, "SpatialPixelsDataFrame") %>% 
+  as.data.frame() %>%
+  ggplot(data = .) +
+  geom_tile(aes(x = x, y = y, fill = layer)) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(title = "NDVI for Sarlahi", 
+       x = " ", 
+       y = " ") +
+  scale_fill_gradient(high = "#CEE50E", 
+                      low = "#087F28",
+                      name = "NDVI")
+
+# Read training points
+training_shp <- st_read("shp_files/LULC_Crop-Types_In-SituData2021_USP.shp")
+training_shp <-st_transform(training_shp, crs(img))
+LULC_aoi <- st_intersection(training_shp, aoi)
+
+# Use mutate to create the "id" column based on the mapping
+class_names <- c("Agriculture"= 1, "Commercial"= 2, "CULARCH"= 3, "Forest"= 4, "PublicUse"= 5, "Residential"= 6, "WaterBodies"= 7)
+LULC_aoi <- LULC_aoi %>%
+  mutate(id = class_names[data_LULC])
+write_sf(LULC_aoi, "shp_files/Sarlahi_TP1.shp")
+training <- st_read("shp_files/Sarlahi_TP1.shp", quiet = TRUE)
+
+#Plot the training points
+ggplot() +
+  geom_sf(data = training, aes(color = data_LULC ), size = 0.5) +
+  scale_color_manual(values = c('cyan', 'burlywood', 'darkgreen', 'blue','grey','red','yellow')) +
+  labs(title = "Classification points by land use") +
+  theme(panel.background = element_blank(), axis.ticks = element_blank(), axis.text = element_blank())
+
+# Split the AOI into training and testing datasets (70% training, 30% testing)
+set.seed(17)  # For reproducibility
+splitIndex <- createDataPartition(training$data_LULC, p = 0.7, 
+                                  list = FALSE, 
+                                  groups = 1)
+training_points <- training[splitIndex, ]
+testing_points <- training[-splitIndex, ]
+unique(testing_points$data_LULC)
+#Extracting spectral values from the raster
+training_points <- as(training_points, 'Spatial')
+df <- raster::extract(image, training_points) %>%
+  round()
+head(df)
+
+#Classifying the imagery
+
+df <- data.frame(training_points$data_LULC, df)
+
+model.class <- rpart(as.factor(training_points.data_LULC)~., data = df, method = 'class', minsplit = 7)
+#plot the decision tree.
+rpart.plot(model.class, box.palette = 0, main = "Classification Tree")
+
+#Using the model, we predict on the entire image and set the classes to the four land cover categories.
+
+pr <- predict(image, model.class, type ='class', progress = 'text') %>% 
+  ratify()
+
+
+levels(pr) <- levels(pr)[[1]] %>% 
+  mutate(legend = c("Agriculture", "Commercial","Forest","Residential","Waterbodies"))
+
+levelplot(pr, maxpixels = 1e6,
+          col.regions = c('cyan', 'burlywood', 'grey', 'darkgreen','red','yellow','blue'),
+          scales=list(draw=FALSE),
+          main = " Classified Imagery")
+
+predicted <- raster::extract(pr, testing_points) %>% 
+  as.data.frame() %>% 
+  rename(id = ".")
+
+df1 <- data.frame(
+  obs_id = testing_points$id,
+  obs = testing_points$data_LULC,
+  pred = predicted$id
+)
+# Replace numeric values with character labels
+df1$pred <- ifelse(df1$pred == 1, "Agriculture",
+                 ifelse(df1$pred == 2, "Commercial",
+                        ifelse(df1$pred == 3, "CULARCH",
+                               ifelse(df1$pred == 4, "Forest",
+                                      ifelse(df1$pred == 5, "PublicUse",
+                                             ifelse(df1$pred == 6, "Residential",
+                                                    ifelse(df1$pred== 7, "WaterBodies", NA)))))))
+actual_classes <- df1$obs
+confusion_matrix <- table(Predicted = df1$pred, Actual = actual_classes)
+print(confusion_matrix)
+
+
+# Convert the confusion matrix to a data frame
+confusion_matrix_df <- as.data.frame(as.table(confusion_matrix))
+
+# Rename the columns for better labels
+colnames(confusion_matrix_df) <- c("Predicted", "Actual", "Frequency")
+
+# Create the heatmap using ggplot2
+heatmap_plot <- ggplot(confusion_matrix_df, aes(Actual, Predicted, fill = Frequency)) +
+  geom_tile() +
+  geom_text(aes(label = Frequency), vjust = 1, size = 4) +
+  scale_fill_gradient(low = "pink", high = "red") +  # Define color palette
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Rotate x-axis labels
+  labs(title = "Confusion Matrix Heatmap", x = "Actual", y = "Predicted")
+
+# Display the heatmap
+print(heatmap_plot)
+
+# Assuming your dataframe is named 'data'
+df1$obs <- as.factor(df1$obs)
+df1$pred <- as.factor(df1$pred)
+
+# Align the levels of 'pred' with the levels of 'obs'
+levels(df1$pred) <- levels(df1$obs)
+
+# Calculate confusion matrix, precision, recall, F-score, accuracy, and Kappa
+confusion_matrix <- confusionMatrix(df1$pred, df1$obs)
+print("Confusion Matrix:")
+print(confusion_matrix)
+```
+
+# Executive Summary
+
+In this report,In this report, I had generated LULC Map of Sarlahi District
+using LandSat 8 image and training data obtained from secondary source 
+volunteered geographic information(VGI) in R. We have used R, along with various 
+packages, for geospatial analysis and machine learning to achieve the objectives. 
+I would like to thank Prof. Arun Pratihasta who inspired and guided through the
+entire project.
+
+**Key Findings:**
+
+1.  **Data Preparation**: I loaded in-situ data and have several
+    proprocessing tasks such as cleaning, removing unusable column, and
+    merging columns as required to represent land use and crop types.
+
+2.  **Satellite Data**: I had downloaded Landsat 8 image from USGS 
+    Earth Explorer and processed in R.
+
+3.  **NDVI Analysis**: I had calculated the NDVI values from the satellite
+    data.
+
+4.  **Machine Learning**: I had implemented a rpart classifier model to predict
+    land cover classes .The model was trained and tested using in-situ data in the
+    ratio of 70%:30%.
+
+5.  **Model Evaluation**: We evaluated the model's performance using a
+    confusion matrix and calculated accuracy, precision, recall, and
+    F1-score for each land cover class. We also determined producer and
+    user accuracy values.
+
+**Recommendations:**
+
+Based on the project findings, the following recommendations can be
+made:
+
+-   The more insitu data should be collect with more accuratly for
+    refining the predictive model.
+
+-   Multiple indices should be used with addition of NDVI to have better
+    predictions.
+
+-   Consider conducting field surveys and data collection to further
+    validate the model's predictions and enhance its reliability.
+
+-   Extend the analysis to a larger geographical area to assess land use
+    and land cover patterns more widely
+
+-   Explore with using more machine learning techniques to compare the
+    results to have better reliability.
+
+# Table of Contents
+
+-   [Introduction](#introduction)
+-   [Methods](#methods)
+-   [Results](#results)
+-   [Discussion](#discussion)
+-   [Conclusion](#conclusion)
+-   [References](#references)
+
+# Introduction {#introduction}
+
+
+
+Land use and land cover mapping using Landsat 8 images in R is a vital technique
+in environmental science, urban planning, and resource management. Landsat 8, a 
+satellite equipped with multispectral sensors, captures data in various spectral
+bands, allowing for the classification of land features. In R, researchers can
+harness powerful geospatial packages like 'raster' and 'rgdal' to process and
+analyze Landsat 8 imagery. By employing spectral indices, such as NDVI, and
+machine learning algorithms like random forests, these tools enable accurate 
+classification of land cover types, including forests, agriculture, urban areas,
+and water bodies. The resulting maps offer valuable insights for sustainable
+land management and conservation efforts.
+
+**Context**
+
+This report focuses on a specific case study involving the mapping of
+land use land cover types using available satellite remote sensing data and 
+VGI data in the context of Madesh Province of Nepal specially Sarlahi District. 
+The in-situ data has been collected after the end of Mansoon in the month of
+October to Janurary. The sample size is approx 600, and is backed with
+photographic proof. The study area has been chosen due to its significance in 
+agriculture and the presence of diverse crop types. The regions is known 
+epicenter of for crop production for the country.
+
+### Objectives
+
+The primary objectives of this report are as follows:
+
+-   To analyze the feasibility and effectiveness of classifying LULC
+    types using satellite remote sensing data and VGI.
+
+-   To visualize the insitu data over the map
+
+-   To assess the accuracy and performance of the classification model
+    with confusion matrix, overall accuracy and individual class
+    performance.
+
+
+
+# Methods
+
+## ***Data Collection:***
+
+**Satellite Remote Sensing Data:** The first component of our data
+collection involved obtaining satellite remote sensing data. We acquired
+multi-spectral Landsat 8 imagery fromvUSGS Earth explorervcovering the study
+area during the month of December, 2021. The metada of Image is as follows:
+GROUP = LANDSAT_METADATA_FILE
+  GROUP = PRODUCT_CONTENTS
+    ORIGIN = "Image courtesy of the U.S. Geological Survey"
+    DIGITAL_OBJECT_IDENTIFIER = "https://doi.org/10.5066/P9OGBGM6"
+    LANDSAT_PRODUCT_ID = "LC08_L2SP_141041_20211226_20211230_02_T1"
+    PROCESSING_LEVEL = "L2SP"
+    COLLECTION_NUMBER = 02
+    COLLECTION_CATEGORY = "T1"
+    OUTPUT_FORMAT = "GEOTIFF"
+    MAP_PROJECTION = "UTM"
+    DATUM = "WGS84"
+    ELLIPSOID = "WGS84"
+    UTM_ZONE = 45
+    GRID_CELL_SIZE_PANCHROMATIC = 15.00
+    GRID_CELL_SIZE_REFLECTIVE = 30.00
+    GRID_CELL_SIZE_THERMAL = 30.00
+    ORIENTATION = "NORTH_UP"
+    RESAMPLING_OPTION = "CUBIC_CONVOLUTION"
+```{r }
+# plot the clipped raster True Color Composite
+par(col.axis="white",col.lab="white",tck=0)
+plotRGB(image, r = 4, g = 3, b = 2, axes = TRUE, 
+        stretch = "lin", main = "True Color Composite")
+box(col="white")
+```
+
+```{r }
+# plot the clipped raster False Color Composite
+par(col.axis="white",col.lab="white",tck=0)
+plotRGB(image, r = 5, g = 4, b = 3, axes = TRUE, stretch = "lin", main = "False Color Composite")
+box(col="white")
+```
+
+
+**Volunteered Geographic Information (VGI):** In parallel with satellite
+data, we had availed in-situ VGI data. The in-situ data used was
+collected after the end of the monsoon from October 23, 2021, to January
+6, 2021. Participants provided valuable ground-level information about
+crop types in the study are with photograph and geographical coordinates
+associated with each observation.
+
+
+## Analysis 
+In this section, we will describe the methods and techniques
+used to process and analyze the collected remote sensing and in-situ
+data. Our primary goal is to classify land use and crop types in the
+study area by integrating satellite imagery with in-situ data.
+
+**Libraries:**
+
+-   **R Language:** We conducted our data analysis and geospatial
+    processing using the R programming language. R is a powerful tool
+    for statistical analysis and geospatial data handling, making it
+    well-suited for our research objectives.
+
+-   **R Packages:** Several R packages were essential for our analysis.
+
+    -   **sf, terra and raster:** These packages allowed us to work with
+        geospatial data, including shapefiles and raster imagery. We
+        calculated the Normalized Difference Vegetation Index (NDVI)
+        using these packages to assess vegetation health.
+
+    -   **dplyr:** This package was used for data manipulation, allowing
+        us to filter, mutate, and aggregate datasets effectively.
+
+    -   **viridis:** We utilized the viridis package for defining custom
+        color palettes in our visualizations, making it easier to
+        distinguish between land cover classes.
+
+    -   **randomForest:** We employed the random forest algorithm for
+        supervised classification tasks.
+
+    -   **knitr,tidyr,ggplot2:** These packages were used for data
+        visualization, including the creation of plots, table and
+        heatmaps.
+
+    -   **leaflet,leaflet.extras:** For the interactive mapping
+        component of our analysis, we utilized the leaflet package.
+
+### ***Data Preprocessing:*** 
+
+The data was clean, check for unusable columns and removed it. The new
+column LU_CT was created to store crop types and other build up area
+merges as Mixed_area.
+
+**Data Projection and Alignment:** To ensure data compatibility, the
+satellite remote sensing data and VGI were projected and aligned to a
+common coordinate reference system (CRS, EPSG:32645).
+
+**NDVI Calculation:** The NDVI was computed using the red and
+near-infrared bands of the satellite imagery. The NDVI calculation was
+performed using the formula (NIR - Red) / (NIR + Red), where NIR
+represents the near-infrared reflectance values and Red represents the
+red band reflectance values. This index is very helpful for
+distinguishing vegetation health and land use. \### NDVI Visualitzation
+
+```{r }
+#We calculate NDVI using the following equation (NIR - Red)/(NIR + Red). The [[ ]] notation specifies the bands, in this case band 5 for NIR and band 4 for Red, within the multi-band raster.
+ndvi <- (image[[5]] - image[[4]])/(image[[5]] + image[[4]])
+
+as(ndvi, "SpatialPixelsDataFrame") %>% 
+  as.data.frame() %>%
+  ggplot(data = .) +
+  geom_tile(aes(x = x, y = y, fill = layer)) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(title = "NDVI for Sarlahi", 
+       x = " ", 
+       y = " ") +
+  scale_fill_gradient(high = "#CEE50E", 
+                      low = "#087F28",
+                      name = "NDVI")
+```
+
+#### I had choosen area of interest as Sarlai District.
+
+
+```{r}
+# Read training points
+training_shp <- st_read("shp_files/LULC_Crop-Types_In-SituData2021_USP.shp")
+training_shp <-st_transform(training_shp, crs(img))
+LULC_aoi <- st_intersection(training_shp, aoi)
+
+# Use mutate to create the "id" column based on the mapping
+class_names <- c("Agriculture"= 1, "Commercial"= 2, "CULARCH"= 3, "Forest"= 4, "PublicUse"= 5, "Residential"= 6, "WaterBodies"= 7)
+LULC_aoi <- LULC_aoi %>%
+  mutate(id = class_names[data_LULC])
+write_sf(LULC_aoi, "shp_files/Sarlahi_TP1.shp")
+training <- st_read("shp_files/Sarlahi_TP1.shp", quiet = TRUE)
+#Plot the training points
+ggplot() +
+  geom_sf(data = training, aes(color = data_LULC ), size = 0.5) +
+  scale_color_manual(values = c('cyan', 'burlywood', 'darkgreen', 'blue','grey','red','yellow')) +
+  labs(title = "Classification points by land use") +
+  theme(panel.background = element_blank(), axis.ticks = element_blank(), axis.text = element_blank())
+
+```
+**Data Splitting** The dataset was clipped with the shapefiles of sarlahi district
+and was further divided into training and testing sets in a proportion of 70% 
+for training and 30% for testing. 
+```{r }
+# Split the AOI into training and testing datasets (70% training, 30% testing)
+set.seed(17)  # For reproducibility
+splitIndex <- createDataPartition(training$data_LULC, p = 0.7, 
+                                  list = FALSE, 
+                                  groups = 1)
+training_points <- training[splitIndex, ]
+testing_points <- training[-splitIndex, ]
+unique(testing_points$data_LULC)
+```
+
+**Classification:**
+
+We use the rpart function in R to create a classification tree model. Here's an explanation of the code:
+model.class <- rpart(...): This line of code assigns the result of the rpart function to the object model.class. The model.class will contain the trained classification tree model.
+as.factor(training_points.data_LULC)~.: This part of the code specifies the formula for the model. It suggests that you are trying to predict the factor variable training_points.data_LULC based on the values of all other variables in the df dataset. In other words, you're building a classification tree to predict the Land Use and Land Cover (LULC) class based on the other variables in the dataset.
+data = df: This specifies the dataset df from which the variables for the model are taken.
+method = 'class': The method parameter is set to 'class', indicating that you are creating a classification tree, as opposed to a regression tree.
+minsplit = 7: The minsplit parameter determines the minimum number of data points required to split a node. In this case, a node will only be split if it has at least 7 data points. This parameter helps control the complexity of the tree.
+```{r }
+#Extracting spectral values from the raster
+training_points <- as(training_points, 'Spatial')
+df <- raster::extract(image, training_points) %>%
+  round()
+head(df)
+```
+
+## **Classification Results:**
+
+The primary objective of this study was to classify land use land cover
+types using the integrated remote sensing and in-situ data. 
+```{r }
+setwd("D:/R_Project")
+#Classifying the imagery
+df <- data.frame(training_points$data_LULC, df)
+model.class <- rpart(as.factor(training_points.data_LULC)~., data = df, method = 'class', minsplit = 7)
+#plot the decision tree.
+rpart.plot(model.class, box.palette = 0, main = "Classification Tree")
+```
+```{r }
+#Using the model, we predict on the entire image and set the classes to the four land cover categories.
+
+pr <- predict(image, model.class, type ='class', progress = 'text') %>% 
+  ratify()
+
+levels(pr) <- levels(pr)[[1]] %>% 
+  mutate(legend = c("Agriculture", "Commercial","Forest","Residential","Waterbodies"))
+
+levelplot(pr, maxpixels = 1e6,
+          col.regions = c('cyan', 'burlywood', 'grey', 'darkgreen','red','yellow','blue'),
+          scales=list(draw=FALSE),
+          main = " Classified Imagery")
+```
+**Overall Accuracy:** The overall accuracy of the classification model
+was approximately 69.23%.
+**Heatmap Visualization of Confusion Matrix:**
+
+To evaluate the performance of our classification model, we created a
+heatmap of the confusion matrix. This heatmap visually represents the
+accuracy and misclassification of different land use and crop types.
+
+```{r }
+# Create the heatmap using ggplot2
+heatmap_plot <- ggplot(confusion_matrix_df, aes(Actual, Predicted, fill = Frequency)) +
+  geom_tile() +
+  geom_text(aes(label = Frequency), vjust = 1, size = 4) +
+  scale_fill_gradient(low = "pink", high = "red") +  # Define color palette
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Rotate x-axis labels
+  labs(title = "Confusion Matrix Heatmap", x = "Actual", y = "Predicted")
+
+# Display the heatmap
+print(heatmap_plot)
+```
+**Confusion Matrix:** The confusion matrix below provides detailed
+information on the model's performance. It displays the number of
+correctly and incorrectly classified samples for each class. It shows
+how well our model correctly classified different land types and helps
+us calculate important performance metrics like accuracy, precision,
+recall, and F1-score. This matrix enables us to assess both the model's
+overall performance and its ability to correctly identify specific land
+use types.
+
+```{r echo=FALSE}
+# Calculate confusion matrix, precision, recall, F-score, accuracy, and Kappa
+confusion_matrix <- confusionMatrix(df1$pred, df1$obs)
+print("Confusion Matrix:")
+print(confusion_matrix)
+```
+
+# Conclusion {#conclusion}
+
+This project highlights the effectiveness of using Rpart machine
+learning models for land use and land cover classification. It
+demonstrates that integrating in-situ data with satellite imagery can
+significantly enhance classification accuracy. The model exhibited
+nice results and also identifies areas for future planning. By continuing
+to refine the model and incorporating more extensive datasets, we can
+further explore the potential of remote sensing and machine learning for
+applications in environmental and urban areas. This work lays the
+foundation for future research and applications in land use and land
+cover classification.
+
+
+
+# References {#references}
+
+1. Volunteered In-Situ Data for Agriculture Crop Mapping: A Case Study of
+Nepal By U. S. Panday , A. K. Pratihast , J. Aryal , R. Kayastha 
+
+2. Pratihast, A. K., DeVries, B., Avitabile, V., de
+Bruin, S., Kooistra, L., Tekle, M., &
+Herold, M. (2014). Combining satellite data
+and community-based observations for
+forest monitoring. Forests.
+https://doi.org/10.3390/f5102464
+
+3. Pratihast, A. K., Herold, M., Avitabile, V., de
+Bruin, S., Bartholomeus, H., Souza, C. M.,
+& Ribbe, L. (2013). Mobile devices for
+community-based REDD+ monitoring: A
+case study for central Vietnam. Sensors
+(Switzerland), 13, 21–38.
+https://doi.org/10.3390/s130100021
